@@ -1,0 +1,126 @@
+%% calc_lcoh.m
+% Levelized Cost of Hydrogen (LCOH) calculation.
+%
+% Uses the standard LCOH definition:
+%
+%   LCOH = (CAPEX * CRF + OPEX_annual) / Annual_H2_production
+%
+% where CRF = Capital Recovery Factor = i*(1+i)^n / ((1+i)^n - 1)
+%
+% References:
+%   IRENA (2020). Green Hydrogen Cost Reduction.
+%   DOE H2A Production Analysis. https://www.hydrogen.energy.gov/h2a_production.html
+
+function lcoh = calc_lcoh(capex, opex_annual, annual_h2_kg, config)
+% calc_lcoh  Compute Levelized Cost of Hydrogen.
+%
+%   lcoh = calc_lcoh(capex, opex_annual, annual_h2_kg, config)
+%
+%   Inputs:
+%     capex        — struct with field .total [USD]
+%     opex_annual  — struct with field .total [USD/yr]
+%     annual_h2_kg — annual hydrogen production [kg/yr]
+%     config       — config struct (uses .discount_rate, .years)
+%
+%   Output:
+%     lcoh         — Levelized Cost of Hydrogen [USD/kg]
+
+validateattributes(annual_h2_kg, {'numeric'}, {'scalar', 'positive'}, ...
+    'calc_lcoh', 'annual_h2_kg');
+
+i = config.discount_rate;
+n = config.years;
+
+% Capital Recovery Factor
+crf = i * (1 + i)^n / ((1 + i)^n - 1);
+
+% Annualised capital cost
+annualised_capex = capex.total * crf;
+
+% LCOH
+lcoh = (annualised_capex + opex_annual.total) / annual_h2_kg;
+
+end
+
+
+%% calc_npv.m — appended below for convenience
+% (In practice, place in its own file: src/analysis/calc_npv.m)
+
+function [npv, irr, payback_years] = calc_npv(capex, opex_annual, revenue_annual, config)
+% calc_npv  Compute NPV, IRR, and simple payback period.
+%
+%   [npv, irr, payback] = calc_npv(capex, opex_annual, revenue_annual, config)
+%
+%   Inputs:
+%     capex           — struct with .total [USD]
+%     opex_annual     — struct with .total [USD/yr]
+%     revenue_annual  — annual revenue from H₂ sales [USD/yr]
+%     config          — uses .years, .discount_rate, .inflation_rate
+%
+%   Outputs:
+%     npv             — Net Present Value [USD]
+%     irr             — Internal Rate of Return [fraction]
+%     payback_years   — Simple payback period [years]
+
+n  = config.years;
+r  = config.discount_rate;
+g  = config.inflation_rate;   % OPEX inflation
+
+% Annual net cash flows (year 1..n)
+cashflows = zeros(1, n + 1);
+cashflows(1) = -capex.total;   % Year 0: upfront CAPEX
+
+for yr = 1:n
+    rev  = revenue_annual;
+    opex = opex_annual.total * (1 + g)^(yr - 1);  % Escalating OPEX
+    cashflows(yr + 1) = rev - opex;
+end
+
+% NPV
+discount_factors = 1 ./ (1 + r).^(0:n);
+npv = sum(cashflows .* discount_factors);
+
+% IRR (numerical root-finding on NPV = 0)
+irr = compute_irr(cashflows);
+
+% Simple payback (undiscounted)
+cumulative = cumsum(cashflows);
+idx = find(cumulative > 0, 1, 'first');
+if isempty(idx)
+    payback_years = Inf;
+elseif idx == 1
+    payback_years = 0;
+else
+    % Linear interpolation
+    payback_years = (idx - 2) + ...
+        (-cumulative(idx - 1)) / (cumulative(idx) - cumulative(idx - 1));
+end
+
+end
+
+function irr = compute_irr(cashflows)
+% Compute IRR via bisection on NPV(r) = 0.
+
+npv_fn = @(r) sum(cashflows ./ (1 + r).^(0:numel(cashflows)-1));
+
+% Bracket search
+lo = -0.50; hi = 5.00;
+if npv_fn(lo) * npv_fn(hi) > 0
+    irr = NaN;  % No real IRR in range
+    return
+end
+
+% Bisection
+for k = 1:100
+    mid = (lo + hi) / 2;
+    if npv_fn(mid) > 0
+        lo = mid;
+    else
+        hi = mid;
+    end
+    if (hi - lo) < 1e-6, break; end
+end
+
+irr = (lo + hi) / 2;
+
+end
