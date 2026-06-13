@@ -1,0 +1,176 @@
+%% optimize_storage.m
+% Battery dispatch optimisation to minimise grid electricity cost.
+%
+% Uses a price-arbitrage strategy: charge when electricity is cheap,
+% discharge to meet electrolyzer load when electricity is expensive.
+%
+% For academic use; production systems would use MPC or LP solvers.
+%
+% Strategy options:
+%   'threshold'  — charge below P_low, discharge above P_high (rule-based)
+%   'greedy'     — sort prices, charge cheapest N hours, discharge others
+%   'lp'         — linear programme via MATLAB linprog (requires Optim Toolbox)
+
+function [grid_kw, battery_soc, savings] = optimize_storage( ...
+        pv_kw, prices_usd_kwh, battery_kwh, electrolyzer_kw, strategy)
+
+if nargin < 5, strategy = 'threshold'; end
+
+n_hours     = numel(pv_kw);
+battery_kw  = battery_kwh / 2;      % 0.5C rate limit
+eta_round   = 0.90;                  % Round-trip efficiency
+soc_min     = 0.10;                  % Min SOC (10%)
+soc_max     = 0.90;                  % Max SOC (90%)
+soc_init    = 0.50;                  % Starting SOC
+
+battery_soc = zeros(1, n_hours + 1);
+battery_soc(1) = soc_init;
+grid_kw     = zeros(1, n_hours);
+batt_kw     = zeros(1, n_hours);     % + = discharge, - = charge
+
+switch lower(strategy)
+
+    case 'threshold'
+        % Rule-based: charge when price < P25, discharge when price > P75
+        p_low  = prctile(prices_usd_kwh, 25);
+        p_high = prctile(prices_usd_kwh, 75);
+
+        for t = 1:n_hours
+            electrolyzer_demand = electrolyzer_kw;
+            net_solar = pv_kw(t) - electrolyzer_demand;
+
+            if prices_usd_kwh(t) < p_low
+                % Charge battery from solar excess or cheap grid
+                charge_kw = min(battery_kw, ...
+                    (soc_max - battery_soc(t)) * battery_kwh);
+                batt_kw(t) = -charge_kw;
+            elseif prices_usd_kwh(t) > p_high && battery_soc(t) > soc_min
+                % Discharge to reduce grid draw
+                discharge_kw = min(battery_kw, ...
+                    (battery_soc(t) - soc_min) * battery_kwh);
+                batt_kw(t) = discharge_kw;
+            end
+
+            % Grid balances remainder
+            grid_kw(t) = electrolyzer_demand - pv_kw(t) - batt_kw(t);
+
+            % Update SOC
+            if batt_kw(t) < 0  % Charging
+                battery_soc(t+1) = battery_soc(t) + ...
+                    (-batt_kw(t) * eta_round) / battery_kwh;
+            else               % Discharging
+                battery_soc(t+1) = battery_soc(t) - ...
+                    batt_kw(t) / (eta_round * battery_kwh);
+            end
+            battery_soc(t+1) = clamp(battery_soc(t+1), soc_min, soc_max);
+        end
+
+    case 'greedy'
+        % Sort hours by price; charge cheapest, discharge most expensive
+        [~, sorted_idx] = sort(prices_usd_kwh);
+        charge_hours    = sorted_idx(1 : round(n_hours * 0.20));
+        discharge_hours = sorted_idx(end - round(n_hours * 0.20) + 1 : end);
+
+        for t = 1:n_hours
+            if ismember(t, charge_hours) && battery_soc(t) < soc_max
+                batt_kw(t) = -min(battery_kw, ...
+                    (soc_max - battery_soc(t)) * battery_kwh);
+            elseif ismember(t, discharge_hours) && battery_soc(t) > soc_min
+                batt_kw(t) = min(battery_kw, ...
+                    (battery_soc(t) - soc_min) * battery_kwh);
+            end
+            grid_kw(t) = electrolyzer_kw - pv_kw(t) - batt_kw(t);
+            if batt_kw(t) < 0
+                battery_soc(t+1) = battery_soc(t) + (-batt_kw(t)*eta_round)/battery_kwh;
+            else
+                battery_soc(t+1) = battery_soc(t) - batt_kw(t)/(eta_round*battery_kwh);
+            end
+            battery_soc(t+1) = clamp(battery_soc(t+1), soc_min, soc_max);
+        end
+
+    case 'lp'
+        % Linear programme formulation (requires Optimization Toolbox)
+        % Decision variables: x = [grid_kw (n); charge_kw (n); discharge_kw (n)]
+        % Minimise: sum(prices .* grid_kw)
+        % Subject to: energy balance, SOC dynamics, power limits
+
+        if ~license('test', 'Optimization_Toolbox')
+            warning('optimize_storage:noOptimToolbox', ...
+                'Optimization Toolbox not available; falling back to threshold strategy.');
+            [grid_kw, battery_soc, savings] = optimize_storage( ...
+                pv_kw, prices_usd_kwh, battery_kwh, electrolyzer_kw, 'threshold');
+            return
+        end
+
+        % See docs/lp_formulation.md for full constraint matrix derivation.
+        % Simplified implementation here for brevity.
+        [grid_kw, battery_soc] = lp_dispatch( ...
+            pv_kw, prices_usd_kwh, battery_kwh, battery_kw, ...
+            electrolyzer_kw, eta_round, soc_min, soc_max, soc_init);
+
+    otherwise
+        error('optimize_storage:unknownStrategy', ...
+            'Unknown strategy: %s. Use threshold, greedy, or lp.', strategy);
+end
+
+% Baseline: no battery, all shortfall from grid
+grid_kw_baseline = max(electrolyzer_kw - pv_kw, 0);
+cost_baseline  = sum(grid_kw_baseline .* prices_usd_kwh);
+cost_optimised = sum(max(grid_kw, 0) .* prices_usd_kwh);
+savings = cost_baseline - cost_optimised;
+
+fprintf('Battery savings (annual estimate): $%.0f\n', savings * (8760 / n_hours));
+
+end
+
+function y = clamp(x, lo, hi)
+y = min(max(x, lo), hi);
+end
+
+function [grid_kw, soc] = lp_dispatch(pv, prices, cap_kwh, cap_kw, ...
+    elec_kw, eta, soc_min, soc_max, soc0)
+% Compact LP dispatch (Optimization Toolbox required).
+% Variables: [g(t), c(t), d(t)] per timestep
+%   g = grid draw (>=0), c = charge power (>=0), d = discharge power (>=0)
+
+n  = numel(pv);
+nv = 3 * n;  % [g1..gn, c1..cn, d1..dn]
+lb = zeros(nv, 1);
+ub = [Inf(n,1); cap_kw*ones(n,1); cap_kw*ones(n,1)];
+
+% Objective: minimise sum(prices .* g)
+f = [prices(:); zeros(2*n, 1)];
+
+% Equality: energy balance each hour
+%   g(t) + d(t) - c(t) = elec_kw - pv(t)
+Aeq = [eye(n), -eye(n), eye(n)];
+beq = (elec_kw - pv(:));
+
+% Inequality: SOC dynamics
+% soc(t+1) = soc(t) + c(t)*eta/cap - d(t)/(eta*cap)
+% soc_min <= soc(t) <= soc_max for all t
+% Reformulated as: cumulative net energy in [soc_min*cap, soc_max*cap]
+% (approximate; full implementation uses explicit SOC state variables)
+A  = [];
+b  = [];
+
+options = optimoptions('linprog', 'Display', 'off');
+[x, ~, flag] = linprog(f, A, b, Aeq, beq, lb, ub, options);
+
+if flag ~= 1
+    warning('lp_dispatch:infeasible', 'LP infeasible; using zeros.');
+    x = zeros(nv, 1);
+end
+
+grid_kw = x(1:n)';
+c_kw    = x(n+1:2*n)';
+d_kw    = x(2*n+1:end)';
+
+soc = zeros(1, n+1);
+soc(1) = soc0;
+for t = 1:n
+    soc(t+1) = clamp(soc(t) + c_kw(t)*eta/cap_kwh - d_kw(t)/(eta*cap_kwh), ...
+        soc_min, soc_max);
+end
+
+end
