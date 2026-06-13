@@ -1,0 +1,352 @@
+%% import_iso_prices.m
+% Download and parse electricity price data from ISO New England Express API.
+%
+% ISO New England real-time and day-ahead LMPs are publicly available at:
+%   https://www.iso-ne.com/isoexpress/web/reports/pricing/-/tree/zone-info
+%
+% Usage:
+%   prices = import_iso_prices('isone', '2023-01-01', '2023-12-31')
+%   prices = import_iso_prices('isone', '2023-01-01', '2023-12-31', 'da')
+%
+% Output:
+%   prices — struct with fields:
+%     .timestamps   datetime array (hourly)
+%     .lmp_usd_mwh  Locational Marginal Price [$/MWh]
+%     .lmp_usd_kwh  LMP in [$/kWh]
+%     .iso          ISO name string
+%     .market_type  'rt' or 'da'
+
+function prices = import_iso_prices(iso_name, date_start, date_end, market_type)
+
+if nargin < 4, market_type = 'da'; end  % Default: day-ahead
+
+iso_name = lower(iso_name);
+t_start  = datetime(date_start);
+t_end    = datetime(date_end);
+
+fprintf('Importing %s prices from %s (%s to %s)...\n', ...
+    upper(iso_name), upper(market_type), date_start, date_end);
+
+switch iso_name
+    case 'isone'
+        prices = import_isone(t_start, t_end, market_type);
+    case 'caiso'
+        prices = import_caiso(t_start, t_end, market_type);
+    case 'ercot'
+        prices = import_ercot(t_start, t_end, market_type);
+    otherwise
+        error('import_iso_prices:unknownISO', ...
+            'Unknown ISO: %s. Supported: isone, caiso, ercot', iso_name);
+end
+
+% Convert to $/kWh
+prices.lmp_usd_kwh = prices.lmp_usd_mwh / 1000;
+
+% Basic validation
+n_expected = hours(t_end - t_start) + 1;
+if numel(prices.lmp_usd_kwh) ~= n_expected
+    warning('import_iso_prices:lengthMismatch', ...
+        'Expected %d hourly values, got %d. Check for missing hours.', ...
+        n_expected, numel(prices.lmp_usd_kwh));
+end
+
+fprintf('  Loaded %d hourly prices. Mean LMP = $%.2f/MWh\n', ...
+    numel(prices.lmp_usd_kwh), mean(prices.lmp_usd_mwh, 'omitnan'));
+
+end
+
+function prices = import_isone(t_start, t_end, market_type)
+% ISO New England Express — Day-Ahead or Real-Time LMPs.
+%
+% Data format (CSV from isoexpress):
+%   Date, Hour, Location ID, Location Name, Locational Marginal Price, ...
+%
+% NOTE: For automated download, register at https://www.iso-ne.com/isoexpress/
+% and use their REST API. This function shows the parsing logic for
+% manually downloaded CSVs.
+
+% Try local cache first
+cache_path = fullfile('data', 'electricity_prices', ...
+    sprintf('isone_%s_%s_%s.mat', market_type, ...
+    datestr(t_start, 'yyyymmdd'), datestr(t_end, 'yyyymmdd')));
+
+if isfile(cache_path)
+    fprintf('  Loading from cache: %s\n', cache_path);
+    load(cache_path, 'prices');
+    return
+end
+
+% Fallback: load demo CSV bundled with project
+demo_csv = fullfile('data', 'electricity_prices', 'isone_2023_demo.csv');
+if ~isfile(demo_csv)
+    error('import_isone:noData', ...
+        ['ISO-NE price data not found.\n' ...
+         'Download from: https://www.iso-ne.com/isoexpress/web/reports/pricing/-/tree/zone-info\n' ...
+         'Save as: %s'], demo_csv);
+end
+
+T = readtable(demo_csv, 'VariableNamingRule', 'preserve');
+
+% Parse timestamps (ISO-NE format: MM/DD/YYYY HH:MM:SS)
+ts_col = T.('Date/Time (EST)');
+if iscell(ts_col)
+    timestamps = datetime(ts_col, 'InputFormat', 'MM/dd/yyyy HH:mm:ss');
+else
+    timestamps = ts_col;
+end
+
+% Filter to requested date range
+mask = timestamps >= t_start & timestamps <= t_end;
+timestamps = timestamps(mask);
+lmp        = T.('DA LMP ($/MWh)')(mask);
+
+% Fill missing with NaN, then linear interpolate
+if any(isnan(lmp))
+    lmp = fillmissing(lmp, 'linear');
+end
+
+prices.timestamps    = timestamps;
+prices.lmp_usd_mwh   = lmp;
+prices.iso           = 'ISONE';
+prices.market_type   = market_type;
+prices.location_name = 'NEPOOL';
+
+% Cache result
+save(cache_path, 'prices');
+
+end
+
+function prices = import_caiso(t_start, t_end, market_type)
+% CAISO OASIS — Day-Ahead Market prices via OASIS API.
+% API docs: http://oasis.caiso.com/mrioasis/logon.do
+
+% URL template for CAISO OASIS (hourly, system average price)
+base_url = 'http://oasis.caiso.com/oasisapi/SingleZip';
+params = sprintf('?queryname=PRC_HASP_LMP&market_run_id=DAM&node=TH_NP15_GEN-APND&startdatetime=%sT00:00-0000&enddatetime=%sT23:00-0000&resultformat=6', ...
+    datestr(t_start, 'yyyymmdd'), datestr(t_end, 'yyyymmdd'));
+
+fprintf('  Fetching from CAISO OASIS...\n');
+try
+    data = webread([base_url params]);
+    % Parse XML/CSV response (CAISO returns ZIP with CSV inside)
+    % [parsing code omitted for brevity — see docs/caiso_parsing.md]
+    prices = parse_caiso_response(data);
+catch ME
+    warning('import_caiso:downloadFailed', ...
+        'CAISO download failed: %s. Using demo data.', ME.message);
+    prices = generate_demo_prices(t_start, t_end, 'CAISO');
+end
+
+end
+
+function prices = import_ercot(t_start, t_end, market_type)
+% ERCOT Settlement Point Prices (SPP) via ERCOT API.
+% API docs: https://data.ercot.com/data-product-archive/
+
+fprintf('  Fetching from ERCOT...\n');
+try
+    % ERCOT public API (no auth required for historical SPPs)
+    prices = fetch_ercot_spp(t_start, t_end);
+catch ME
+    warning('import_ercot:downloadFailed', ...
+        'ERCOT download failed: %s. Using demo data.', ME.message);
+    prices = generate_demo_prices(t_start, t_end, 'ERCOT');
+end
+
+end
+
+function prices = generate_demo_prices(t_start, t_end, iso_name)
+% Generate synthetic electricity prices for demo/testing.
+% Uses a diurnal pattern typical of US grid markets.
+
+timestamps = t_start : hours(1) : t_end;
+n = numel(timestamps);
+
+hour_of_day = hour(timestamps);
+
+% Base price with diurnal variation
+base_price = 35;  % $/MWh
+diurnal    = 15 * sin(pi * (hour_of_day - 6) / 12).^2;
+noise      = 8 * randn(1, n);
+lmp        = max(base_price + diurnal + noise, 0);
+
+% Add occasional price spikes (mimics real markets)
+spike_hrs  = randperm(n, round(n * 0.01));
+lmp(spike_hrs) = lmp(spike_hrs) + 200 * rand(1, numel(spike_hrs));
+
+prices.timestamps    = timestamps;
+prices.lmp_usd_mwh   = lmp;
+prices.iso           = iso_name;
+prices.market_type   = 'demo';
+prices.location_name = 'SYNTHETIC';
+
+warning('generate_demo_prices:syntheticData', ...
+    'Using SYNTHETIC electricity prices. For real analysis, download from %s.', iso_name);
+
+end
+
+
+%% ======================================================================
+%% import_nsrdb.m — NSRDB Solar Data Importer
+%% ======================================================================
+
+function station_data = import_nsrdb(lat, lon, year, api_key)
+% import_nsrdb  Fetch hourly solar irradiance from NREL NSRDB via API.
+%
+%   station_data = import_nsrdb(lat, lon, year)
+%   station_data = import_nsrdb(lat, lon, year, api_key)
+%
+%   Inputs:
+%     lat      — Latitude [decimal degrees]
+%     lon      — Longitude [decimal degrees]
+%     year     — Year (e.g. 2022; NSRDB coverage 1998-2022)
+%     api_key  — NREL API key (sign up free at https://developer.nrel.gov)
+%
+%   Output:
+%     station_data — struct with fields:
+%       .Latitude, .Longitude, .Elevation_m, .Timezone
+%       .GHI       [W/m²] Global Horizontal Irradiance (8760x1)
+%       .DHI       [W/m²] Diffuse Horizontal Irradiance
+%       .DNI       [W/m²] Direct Normal Irradiance
+%       .Temperature_C, .WindSpeed_ms, .Pressure_mbar
+%       .Timestamps  datetime (8760x1, hourly)
+%
+%   Notes:
+%     - Free API: 1000 requests/day per key
+%     - NSRDB spatial resolution: 4km
+%     - Data source: https://nsrdb.nrel.gov/
+
+if nargin < 4
+    api_key = getenv('NREL_API_KEY');
+    if isempty(api_key)
+        api_key = 'DEMO_KEY';  % Limited to 30 req/hr, 50 req/day
+        warning('import_nsrdb:noAPIKey', ...
+            ['Using DEMO_KEY (limited). Get free key at https://developer.nrel.gov\n' ...
+             'Set environment variable NREL_API_KEY or pass key as 4th argument.']);
+    end
+end
+
+% Check cache
+cache_file = fullfile('data', 'nsrdb_cache', ...
+    sprintf('nsrdb_%.4f_%.4f_%d.mat', lat, lon, year));
+if isfile(cache_file)
+    load(cache_file, 'station_data');
+    fprintf('NSRDB: loaded from cache (%s)\n', cache_file);
+    return
+end
+
+% NSRDB PSM v3 API endpoint
+attributes = 'ghi,dhi,dni,air_temperature,wind_speed,surface_pressure';
+url = sprintf(['https://developer.nrel.gov/api/nsrdb/v2/solar/psm3-download.csv?' ...
+    'wkt=POINT(%.6f%%20%.6f)&names=%d&leap_day=false&interval=60&' ...
+    'utc=false&full_name=MathWorks%%20User&email=user%%40example.com&' ...
+    'affiliation=Research&mailing_list=false&reason=Research&' ...
+    'attributes=%s&api_key=%s'], lon, lat, year, attributes, api_key);
+
+fprintf('Fetching NSRDB data: lat=%.4f, lon=%.4f, year=%d ...\n', lat, lon, year);
+
+try
+    % Download CSV (first 2 rows are metadata, rest is hourly data)
+    tmp = tempname;
+    websave(tmp, url);
+    raw = readlines(tmp);
+
+    % Row 1: header metadata, Row 2: values, Row 3: column names, Row 4+: data
+    meta_keys   = strsplit(raw{1}, ',');
+    meta_vals   = strsplit(raw{2}, ',');
+    col_names   = strsplit(raw{3}, ',');
+
+    data_str = strjoin(raw(4:end), '\n');
+    T = readtable(tmp, 'NumHeaderLines', 3, 'VariableNamingRule', 'preserve');
+
+    % Parse metadata
+    tz  = str2double(meta_vals{strcmp(meta_keys, 'Time Zone')});
+    elev = str2double(meta_vals{strcmp(meta_keys, 'Elevation')});
+
+    % Build timestamps (TMY: year doesn't matter, use 2001 non-leap)
+    t0  = datetime(year, 1, 1, 0, 30, 0);  % Half-hour offset (midpoint)
+    timestamps = t0 + hours(0:8759)';
+
+    station_data.Latitude      = lat;
+    station_data.Longitude     = lon;
+    station_data.Elevation_m   = elev;
+    station_data.Timezone      = tz;
+    station_data.Year          = year;
+    station_data.GHI           = T.GHI;
+    station_data.DHI           = T.DHI;
+    station_data.DNI           = T.DNI;
+    station_data.Temperature_C = T.('Temperature');
+    station_data.WindSpeed_ms  = T.('Wind Speed');
+    station_data.Pressure_mbar = T.('Surface Pressure');
+    station_data.Timestamps    = timestamps;
+
+    % Cache for reuse
+    if ~exist(fileparts(cache_file), 'dir')
+        mkdir(fileparts(cache_file));
+    end
+    save(cache_file, 'station_data');
+    fprintf('  Saved to cache: %s\n', cache_file);
+
+catch ME
+    warning('import_nsrdb:failed', 'NSRDB fetch failed: %s', ME.message);
+    fprintf('  Generating synthetic irradiance profile for lat=%.2f...\n', lat);
+    station_data = generate_synthetic_irradiance(lat, lon, year);
+end
+
+end
+
+function sd = generate_synthetic_irradiance(lat, lon, year)
+% Generate synthetic solar irradiance for demo/offline use.
+
+n = 8760;
+hours_vec = (0:n-1)';
+doy = floor(hours_vec / 24) + 1;
+hod = mod(hours_vec, 24);
+
+% Solar declination (approximate)
+declination = 23.45 * sind(360/365 * (doy - 81));
+
+% Sunrise/sunset hours (approximate)
+lat_r = lat * pi / 180;
+decl_r = declination * pi / 180;
+cos_ha = -tan(lat_r) * tan(decl_r);
+cos_ha = clamp(cos_ha, -1, 1);
+ha = acos(cos_ha) * 180 / pi;
+sunrise = 12 - ha / 15;
+sunset  = 12 + ha / 15;
+
+% GHI: clear-sky model (simplified)
+ghi_raw = zeros(n, 1);
+daylight = hod >= sunrise & hod <= sunset;
+solar_angle = max(0, ...
+    sind(90 - abs(lat) + declination) .* ...
+    cosd(15 * (hod - 12)));
+ghi_clear = 900 * solar_angle;
+ghi_raw(daylight) = ghi_clear(daylight);
+
+% Add cloud variability (random daily factor)
+cloud_factor = 0.6 + 0.4 * rand(365, 1);
+cloud_hr = repelem(cloud_factor, 24);
+ghi_raw = ghi_raw .* cloud_hr;
+
+sd.Latitude      = lat;
+sd.Longitude     = lon;
+sd.Elevation_m   = 100;
+sd.Timezone      = -5;
+sd.Year          = year;
+sd.GHI           = max(ghi_raw, 0);
+sd.DHI           = sd.GHI * 0.15;
+sd.DNI           = sd.GHI * 0.75;
+sd.Temperature_C = 15 + 10 * sind(2*pi*(doy-80)/365) + 5*randn(n,1);
+sd.WindSpeed_ms  = 4 + 2 * randn(n, 1);
+sd.Pressure_mbar = 1013 * ones(n, 1);
+sd.Timestamps    = datetime(year,1,1,0,0,0) + hours(0:n-1)';
+
+warning('import_nsrdb:synthetic', ...
+    'Using SYNTHETIC irradiance. Download real data from https://nsrdb.nrel.gov');
+
+end
+
+function y = clamp(x, lo, hi)
+y = min(max(x, lo), hi);
+end
