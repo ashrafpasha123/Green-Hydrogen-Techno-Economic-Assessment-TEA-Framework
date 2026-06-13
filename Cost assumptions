@@ -1,0 +1,102 @@
+{
+  "_comment": "Green Hydrogen TEA — Cost Assumptions (2024 USD)",
+  "_source": "IRENA 2023, NREL H2A, BloombergNEF 2024",
+  "_last_updated": "2024-01-15",
+
+  "project": {
+    "lifetime_years": 20,
+    "discount_rate_wacc": 0.08,
+    "inflation_rate": 0.03,
+    "currency": "USD",
+    "base_year": 2024
+  },
+
+  "solar_pv": {
+    "capex_usd_per_kw": 900,
+    "comment_capex": "Utility-scale fixed-tilt; NREL 2024 ATB mid-case",
+    "om_usd_per_kw_yr": 15,
+    "degradation_pct_per_yr": 0.5,
+    "inverter_efficiency": 0.97,
+    "dc_to_ac_ratio": 1.2,
+    "lifetime_years": 25
+  },
+
+  "electrolyzer_pem": {
+    "capex_usd_per_kw": 1200,
+    "comment_capex": "PEM stack + BoP; BloombergNEF 2024 H2 Outlook",
+    "capex_trajectory": {
+      "2024": 1200,
+      "2027": 900,
+      "2030": 600,
+      "2035": 350,
+      "comment": "DOE Hydrogen Shot trajectory toward $1/kg-H2"
+    },
+    "efficiency_hhv_fraction": 0.70,
+    "specific_energy_kwh_per_kg": 56.3,
+    "stack_lifetime_hours": 80000,
+    "stack_replacement_fraction_of_capex": 0.40,
+    "water_consumption_l_per_kg_h2": 9.0,
+    "min_load_fraction": 0.10,
+    "ramp_rate_pct_per_min": 10
+  },
+
+  "battery_storage_lfp": {
+    "capex_usd_per_kwh": 280,
+    "comment_capex": "LFP pack installed; BloombergNEF 2024",
+    "capex_usd_per_kw": 80,
+    "roundtrip_efficiency_fraction": 0.90,
+    "soc_min_fraction": 0.10,
+    "soc_max_fraction": 0.90,
+    "calendar_life_years": 15,
+    "cycle_life_cycles": 4000,
+    "om_usd_per_kw_yr": 6,
+    "replacement_cost_fraction": 0.80
+  },
+
+  "hydrogen_storage": {
+    "compressor_capex_usd_per_kw": 1500,
+    "tank_capex_usd_per_kg": 800,
+    "comment": "Type IV composite, 700 bar",
+    "compression_energy_kwh_per_kg": 2.5,
+    "om_fraction_of_capex": 0.02
+  },
+
+  "balance_of_plant": {
+    "bop_fraction_of_equipment": 0.15,
+    "comment": "Piping, instrumentation, electrical, civil works",
+    "installation_fraction_of_equipment": 0.10,
+    "engineering_fraction_of_equipment": 0.05
+  },
+
+  "operating_costs": {
+    "water_cost_usd_per_liter": 0.005,
+    "comment_water": "Municipal supply; adjust for regional scarcity",
+    "om_fraction_of_capex_per_yr": 0.02,
+    "insurance_fraction_of_capex": 0.005,
+    "land_lease_usd_per_acre_yr": 2000,
+    "labor_usd_per_yr": 120000,
+    "comment_labor": "1.5 FTE operators at $80k/yr fully loaded"
+  },
+
+  "revenue": {
+    "h2_sale_price_usd_per_kg": 6.00,
+    "comment": "Wholesale compressed H2; excludes transport/dispensing",
+    "h2_price_scenarios": {
+      "low": 4.00,
+      "base": 6.00,
+      "high": 9.00,
+      "doe_target_2031": 1.00
+    },
+    "rec_credit_usd_per_mwh": 25,
+    "45v_ptc_usd_per_kg": 3.00,
+    "comment_45v": "IRA Section 45V clean hydrogen PTC (max tier)"
+  },
+
+  "sensitivity_ranges": {
+    "capex_variation_pct": 30,
+    "electricity_price_variation_pct": 50,
+    "h2_price_variation_pct": 40,
+    "electrolyzer_efficiency_range": [0.60, 0.80],
+    "discount_rate_range": [0.05, 0.12]
+  }
+}
