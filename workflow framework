@@ -1,0 +1,179 @@
+name: CI — MATLAB TEA Framework
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run weekly to catch data API regressions
+    - cron: '0 6 * * 1'
+
+env:
+  MATLAB_VERSION: R2023b
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Unit tests (no MATLAB license needed via MATLAB Actions)
+  # ──────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          release: ${{ env.MATLAB_VERSION }}
+          products: |
+            Simulink
+            Simscape
+            Statistics_and_Machine_Learning_Toolbox
+            Optimization_Toolbox
+            Parallel_Computing_Toolbox
+
+      - name: Add project to path and run tests
+        uses: matlab-actions/run-tests@v2
+        with:
+          source-folder: src
+          test-results-junit: test-results/results.xml
+          code-coverage-cobertura: coverage/coverage.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage/coverage.xml
+          flags: matlab-unit-tests
+
+  # ──────────────────────────────────────────────
+  # Job 2: Integration test (single-location TEA)
+  # ──────────────────────────────────────────────
+  integration-test:
+    name: Integration Test (Single Location)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          release: ${{ env.MATLAB_VERSION }}
+          products: Simulink Simscape Optimization_Toolbox
+
+      - name: Run single-location TEA
+        uses: matlab-actions/run-command@v2
+        with:
+          command: |
+            addpath(genpath('src'));
+            % Use synthetic data (no API keys needed in CI)
+            setenv('USE_SYNTHETIC_DATA', '1');
+            results = run_tea_single('Phoenix_AZ');
+            assert(results.lcoh > 0 && results.lcoh < 20, ...
+                'LCOH out of expected range: %.2f', results.lcoh);
+            assert(results.annual_h2_kg > 0, 'No hydrogen produced');
+            fprintf('CI: LCOH = $%.2f/kg, H2 = %.0f kg/yr\n', ...
+                results.lcoh, results.annual_h2_kg);
+
+      - name: Upload simulation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-results
+          path: results/
+
+  # ──────────────────────────────────────────────
+  # Job 3: Multi-location TEA (PR only, manual trigger)
+  # ──────────────────────────────────────────────
+  full-tea:
+    name: Full Multi-Location TEA
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    needs: integration-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          release: ${{ env.MATLAB_VERSION }}
+          products: |
+            Simulink
+            Simscape
+            Optimization_Toolbox
+            Parallel_Computing_Toolbox
+
+      - name: Run full multi-location TEA
+        uses: matlab-actions/run-command@v2
+        env:
+          NREL_API_KEY: ${{ secrets.NREL_API_KEY }}
+          USE_SYNTHETIC_DATA: '1'  # Override for CI; remove for production
+        with:
+          command: |
+            addpath(genpath('src'));
+            load('data/locations/station_data_demo.mat');
+            prices = generate_demo_prices(datetime('2023-01-01'), ...
+                                          datetime('2023-12-31'), 'ISONE');
+            config = default_config();
+            config.use_parallel = true;
+            results = run_tea_all_locations(StationData, prices, config);
+            generate_report(results, 'results/tea_report_ci.html');
+
+      - name: Upload full TEA report
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-tea-report
+          path: results/tea_report_ci.html
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # Job 4: Lint / static analysis
+  # ──────────────────────────────────────────────
+  lint:
+    name: MATLAB Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          release: ${{ env.MATLAB_VERSION }}
+
+      - name: Run MATLAB Code Analyzer (mlint)
+        uses: matlab-actions/run-command@v2
+        with:
+          command: |
+            % Run mlint on all .m files; fail on errors
+            files = dir(fullfile('src', '**', '*.m'));
+            has_errors = false;
+            for k = 1:numel(files)
+                fpath = fullfile(files(k).folder, files(k).name);
+                msgs  = checkcode(fpath, '-id');
+                errors = msgs([msgs.fix] == 0);  % Non-auto-fixable issues
+                if ~isempty(errors)
+                    fprintf('LINT ERROR in %s:\n', fpath);
+                    for m = 1:numel(errors)
+                        fprintf('  Line %d: [%s] %s\n', ...
+                            errors(m).line, errors(m).id, errors(m).message);
+                    end
+                    has_errors = true;
+                end
+            end
+            if has_errors
+                error('Lint errors found. Fix before merging.');
+            else
+                fprintf('All files passed lint check.\n');
+            end
